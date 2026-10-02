@@ -2,6 +2,7 @@
   import { getApp } from './lib/db/state.svelte';
   import ProfilePanel from './lib/components/ProfilePanel.svelte';
   import ProjectsPanel from './lib/components/ProjectsPanel.svelte';
+  import HandoverPanel from './lib/components/HandoverPanel.svelte';
   import CanvasView from './lib/components/CanvasView.svelte';
   import Sampler from './lib/components/Sampler.svelte';
   import ExportBar from './lib/components/ExportBar.svelte';
@@ -100,6 +101,14 @@
   {#if s.initError}
     <div class="banner danger">初始化失败：{s.initError}</div>
   {/if}
+  {#if s.migration && (s.migration.profilesBackfilled > 0 || s.migration.legacyProjects > 0)}
+    <div class="banner migrate" title="旧格式工程仍可正常载入，并与新交接包工程共存">
+      迁移：已为 {s.migration.profilesBackfilled} 个旧配置补算指纹；库中有 {s.migration.legacyProjects} 个旧格式工程（无指纹，按原记录载入，与新交接包共存）。
+    </div>
+  {/if}
+  {#if s.projectWarnings.length > 0}
+    <div class="banner danger">工程完整性校验：{s.projectWarnings.join('；')}</div>
+  {/if}
   {#if s.notice}
     <button class="banner" onclick={clearNotice}>{s.notice}（点击关闭）</button>
   {/if}
@@ -111,6 +120,7 @@
       <aside class="sidebar scroll">
         <ProfilePanel {app} />
         <ProjectsPanel {app} />
+        <HandoverPanel {app} />
         <div class="panel small muted attribution">{PROFILE_ATTRIBUTION}</div>
       </aside>
 
@@ -234,6 +244,10 @@
   }
   .banner.danger {
     background: #3a2020;
+    cursor: default;
+  }
+  .banner.migrate {
+    background: #20303a;
     cursor: default;
   }
   .loading {

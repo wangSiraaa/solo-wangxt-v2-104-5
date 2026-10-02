@@ -4,9 +4,19 @@
  *  - profile library (IndexedDB)
  *  - target profile, intent, BPC
  *  - worker conversion results + sampler
- *  - project save/load
+ *  - project save/load and verifiable handover package export/import
  */
-import { idbAll, idbDelete, idbPut, STORE_PROJECTS, STORE_PROFILES, type StoredProfile, type StoredProject } from './db';
+import {
+  idbAll,
+  idbAtomic,
+  idbDelete,
+  idbPut,
+  CURRENT_RECORD_VERSION,
+  STORE_PROJECTS,
+  STORE_PROFILES,
+  type StoredProfile,
+  type StoredProject,
+} from './db';
 import { seedBuiltinProfiles } from './builtinProfiles';
 import { extractEmbeddedICC, detectContainer } from '../icc/extractEmbedded';
 import { readProfileInfo, type ProfileInfo, type ColorSpaceKind } from '../icc/profileInfo';
@@ -14,6 +24,11 @@ import { detectProvenance } from '../icc/provenance';
 import { runConvert, runSample, type ConvertedPayload } from '../workers/client';
 import type { EngineParams, SampleInfo } from '../color/engine';
 import type { RenderingIntent } from '../color/lcms';
+import { sha256 } from '../color/sha256';
+import { buildHandoverPackage } from '../handover/buildPackage';
+import { importHandoverPackage, verifyStoredProject, type HandoverImportReport } from '../handover/importPackage';
+import { HANDOVER_EXTENSION } from '../version';
+import { downloadBytes } from '../codec/export';
 
 export type SourceStatus =
   | { kind: 'none' }
@@ -40,6 +55,11 @@ interface SamplePoint {
   error?: string;
 }
 
+export interface MigrationInfo {
+  profilesBackfilled: number;
+  legacyProjects: number;
+}
+
 let uid = 1;
 export const newId = (p = 'p') => `${p}-${Date.now().toString(36)}-${uid++}`;
 
@@ -64,15 +84,39 @@ function createAppState() {
     resultKey: '' as string,
     hover: { x: 0, y: 0, info: null as SampleInfo | null, pending: false } as SamplePoint,
     pins: [] as SamplePoint[],
-    projects: [] as { id: string; name: string; updatedAt: string }[],
+    projects: [] as { id: string; name: string; updatedAt: string; handover?: boolean; legacy?: boolean }[],
     busyProfiles: false,
     notice: '' as string,
     showOriginalManaged: true,
+    busyHandover: false,
+    handoverReport: null as HandoverImportReport | null,
+    /** warnings from the fingerprint check on the currently loaded project */
+    projectWarnings: [] as string[],
+    loadedProject: null as { id: string; legacy: boolean; handover?: boolean } | null,
+    migration: null as MigrationInfo | null,
   });
 
+  /**
+   * Startup does a lazy migration without bumping the IndexedDB schema:
+   * profile rows imported by older builds get a backfilled sha256 (one
+   * transaction), and legacy projects are counted but otherwise left intact.
+   */
   async function init() {
     try {
       await seedBuiltinProfiles();
+      // Backfill fingerprints for any profile rows lacking them (single tx).
+      const all0 = await idbAll<StoredProfile>(STORE_PROFILES);
+      const need = all0.filter((p) => !p.sha256);
+      for (const p of need) p.sha256 = await sha256(p.bytes);
+      if (need.length > 0) {
+        await idbAtomic([STORE_PROFILES], ([store]) => {
+          for (const p of need) store.put(p);
+        });
+      }
+      const projects0 = await idbAll<StoredProject>(STORE_PROJECTS);
+      const legacyCount = projects0.filter((p) => p.recordVersion === undefined).length;
+      state.migration = { profilesBackfilled: need.length, legacyProjects: legacyCount };
+
       state.profiles = await idbAll<StoredProfile>(STORE_PROFILES);
       state.profiles.sort((a, b) => a.description.localeCompare(b.description));
       if (!state.targetProfile) {
@@ -83,6 +127,8 @@ function createAppState() {
         id: p.id,
         name: p.name,
         updatedAt: p.updatedAt,
+        handover: !!p.handover,
+        legacy: p.recordVersion === undefined,
       }));
       state.projects.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
       state.ready = true;
@@ -117,6 +163,9 @@ function createAppState() {
     state.convertError = '';
     state.sourceAssumed = false;
     state.sourceProfile = null;
+    state.projectWarnings = [];
+    state.loadedProject = null;
+    state.handoverReport = null;
 
     if (embedded && info?.valid) {
       // Profile the pixels were actually tagged with; record identity for display.
@@ -237,6 +286,13 @@ function createAppState() {
         state.notice = `已跳过 ${file.name}：不是有效的 RGB/CMYK/Gray ICC 配置。`;
         continue;
       }
+      const hex = await sha256(bytes);
+      // Fingerprint dedupe also applies to manual imports.
+      const dup = state.profiles.find((p) => p.sha256 === hex);
+      if (dup) {
+        added.push(`${info.description || file.name}（相同指纹已存在，已复用）`);
+        continue;
+      }
       const id = newId('icc');
       const profile: StoredProfile = {
         id,
@@ -247,6 +303,7 @@ function createAppState() {
         origin: 'user-imported',
         addedAt: new Date().toISOString(),
         size: bytes.byteLength,
+        sha256: hex,
       };
       await idbPut(STORE_PROFILES, profile);
       added.push(profile.description);
@@ -260,6 +317,12 @@ function createAppState() {
   async function saveProject(name: string) {
     if (!state.image || !state.sourceProfile) return;
     const id = newId('proj');
+    const imageSha = await sha256(state.image.bytes);
+    const sourceIsEmbedded = !!state.image.embedded && !state.sourceAssumed;
+    const sourceSha = sourceIsEmbedded
+      ? await sha256(state.image.embedded!)
+      : state.sourceProfile.sha256 ?? (await sha256(state.sourceProfile.bytes));
+    const targetSha = state.targetProfile?.sha256 ?? (state.targetProfile ? await sha256(state.targetProfile.bytes) : null);
     const p: StoredProject = {
       id,
       name: name || state.image.name,
@@ -267,24 +330,36 @@ function createAppState() {
       imageBytes: state.image.bytes,
       imageName: state.image.name,
       embeddedICC: state.image.embedded ?? undefined,
-      sourceProfileId: state.sourceProfile.id.startsWith('embedded:') ? null : state.sourceProfile.id,
-      sourceIsEmbedded: !!state.image.embedded,
+      sourceProfileId: sourceIsEmbedded ? null : state.sourceProfile.id,
+      sourceIsEmbedded,
       sourceAssumptionNote: state.sourceAssumed
         ? '原图缺少嵌入配置，操作员手动选择源配置（假设已记录）'
         : undefined,
       targetProfileId: state.targetProfile?.id ?? null,
       intent: state.intent,
       blackPointCompensation: state.blackPointCompensation,
+      proofIntent: state.proofIntent,
       provenanceSeen: state.image.provenance.converted,
+      recordVersion: CURRENT_RECORD_VERSION,
+      imageSha256: imageSha,
+      sourceSha256: sourceSha,
+      targetSha256: targetSha,
     };
     await idbPut(STORE_PROJECTS, p);
+    await refreshProjects();
+    state.loadedProject = { id: p.id, legacy: false };
+    state.notice = `工程已保存到本机 IndexedDB：${p.name}`;
+  }
+
+  async function refreshProjects() {
     state.projects = (await idbAll<StoredProject>(STORE_PROJECTS)).map((x) => ({
       id: x.id,
       name: x.name,
       updatedAt: x.updatedAt,
+      handover: !!x.handover,
+      legacy: x.recordVersion === undefined,
     }));
     state.projects.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    state.notice = `工程已保存到本机 IndexedDB：${p.name}`;
   }
 
   async function loadProject(id: string) {
@@ -301,6 +376,14 @@ function createAppState() {
     };
     const all = await idbAll<StoredProfile>(STORE_PROFILES);
     state.profiles = all.sort((a, b) => a.description.localeCompare(b.description));
+
+    // Fingerprint verification of everything the project depends on. Legacy
+    // (pre-handover) projects have no fingerprints: they still load; their
+    // informational "old format" note goes to the notice bar, not the warning
+    // banner (which is reserved for real integrity problems).
+    const verification = await verifyStoredProject(p, all);
+    state.projectWarnings = verification.legacy ? [] : verification.issues;
+
     if (p.sourceIsEmbedded && embedded) {
       const info = readProfileInfo(embedded);
       state.sourceProfile = {
@@ -320,12 +403,24 @@ function createAppState() {
       state.sourceProfile = sp;
       state.sourceAssumed = true;
       state.sourceEmbeddedInfo = null;
+    } else {
+      state.sourceProfile = null;
+      state.sourceAssumed = true;
+      state.sourceEmbeddedInfo = null;
     }
     state.targetProfile = all.find((x) => x.id === p.targetProfileId) ?? null;
     state.intent = p.intent;
     state.blackPointCompensation = p.blackPointCompensation;
+    state.proofIntent = p.proofIntent ?? 'relative-colorimetric';
+    state.loadedProject = { id: p.id, legacy: p.recordVersion === undefined, handover: !!p.handover };
+    state.handoverReport = null;
     invalidate();
-    state.notice = `已载入工程：${p.name}`;
+    const tail = verification.legacy
+      ? `（${verification.issues[0]}）`
+      : verification.issues.length
+        ? `；校验提示：${verification.issues.join('；')}`
+        : '；内容指纹校验通过';
+    state.notice = `已载入工程：${p.name}${tail}`;
   }
 
   async function deleteProject(id: string) {
@@ -340,6 +435,89 @@ function createAppState() {
     if (state.sourceProfile?.id === id) state.sourceProfile = null;
     if (state.targetProfile?.id === id) state.targetProfile = null;
     invalidate();
+  }
+
+  // ---- handover packages -------------------------------------------------
+
+  async function exportHandover(projectNameInput: string): Promise<{ ok: boolean; error?: string; fileName?: string }> {
+    if (!state.image || !state.sourceProfile || !state.targetProfile) {
+      return { ok: false, error: '需要先确定原图、源依据与目标配置' };
+    }
+    state.busyHandover = true;
+    try {
+      const sourceIsEmbedded = !!state.image.embedded && !state.sourceAssumed;
+      const projectName = projectNameInput || state.image.name;
+      // Stable identity: re-exporting the same loaded project must byte-match
+      // its earlier package so re-import is idempotent. Only unsaved work gets
+      // a fresh timestamp (then saving first is the recommended path).
+      const loaded = state.loadedProject
+        ? state.projects.find((p) => p.id === state.loadedProject!.id)
+        : null;
+      const savedAt = loaded?.updatedAt ?? new Date().toISOString();
+      const { bytes } = await buildHandoverPackage({
+        projectName,
+        savedAt,
+        imageBytes: state.image.bytes,
+        imageName: state.image.name,
+        bitDepth: state.image.bitDepth,
+        sourceKind: sourceIsEmbedded ? 'embedded' : 'assumed',
+        assumedProfile: sourceIsEmbedded ? undefined : state.sourceProfile,
+        assumptionNote:
+          '原图缺少嵌入配置，操作员手动选择源配置（假设已记录）；随交接包携带该 ICC 与指纹以供核验。',
+        targetProfile: state.targetProfile,
+        intent: state.intent,
+        blackPointCompensation: state.blackPointCompensation,
+        proofIntent: state.proofIntent,
+      });
+      const base = (state.image.name.replace(/\.[^.]+$/, '') || 'image').slice(0, 60);
+      const fileName = `${base}-handover${HANDOVER_EXTENSION}`;
+      downloadBytes(fileName, bytes, 'application/octet-stream');
+      state.notice = `已导出可验证交接包：${fileName}（含原图、源依据 ICC、目标 ICC、指纹与目标条件）`;
+      return { ok: true, fileName };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      state.busyHandover = false;
+    }
+  }
+
+  async function importHandover(file: File) {
+    state.busyHandover = true;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const report = await importHandoverPackage(bytes, file.name);
+      state.handoverReport = report;
+      await refreshProfilesAndProjects();
+      if (report.ok) {
+        const parts: string[] = [];
+        const reused = report.profiles.filter((p) => p.action === 'reused').length;
+        const added = report.profiles.filter((p) => p.action === 'added').length;
+        parts.push(`配置：复用 ${reused} 个、新增 ${added} 个`);
+        const collision = report.profiles.flatMap((p) => p.nameCollision);
+        if (collision.length) parts.push(`同名不同字节隔离 ${collision.length} 个`);
+        if (report.idempotent) parts.push('同一交接包已存在，幂等跳过（无重复写入）');
+        state.notice = `交接包导入完成（${report.project.outcome}）：${parts.join('；')}`;
+        // Auto-open the restored project when a project row exists.
+        if (report.project.projectId && report.project.outcome !== 'idempotent-skip') {
+          await loadProject(report.project.projectId);
+          // keep the report visible across the loadProject notice overwrite
+          state.handoverReport = report;
+        } else if (report.project.projectId) {
+          await loadProject(report.project.projectId);
+          state.handoverReport = report;
+        }
+      } else {
+        state.notice = `交接包被拒绝（${report.rejectedStage}）：${report.error}`;
+      }
+    } finally {
+      state.busyHandover = false;
+    }
+  }
+
+  async function refreshProfilesAndProjects() {
+    state.profiles = await idbAll<StoredProfile>(STORE_PROFILES);
+    state.profiles.sort((a, b) => a.description.localeCompare(b.description));
+    await refreshProjects();
   }
 
   return {
@@ -357,6 +535,9 @@ function createAppState() {
     loadProject,
     deleteProject,
     deleteProfile,
+    exportHandover,
+    importHandover,
+    dismissHandoverReport: () => (state.handoverReport = null),
     get needsSourceChoice() {
       return needsSourceChoice;
     },

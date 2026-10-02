@@ -171,9 +171,15 @@
     <div class="profilelist scroll">
       {#each s.profiles as p (p.id)}
         <div class="row spread pl">
-          <span class="small" title={p.id}>
+          <span class="small profcell" title={'指纹 ' + (p.sha256 ?? '(未回填)') + '\n' + p.id}>
             <span class="badge cs-{p.colorSpace}">{p.colorSpace}</span>
             {p.description}
+            {#if p.packageSource}
+              <span class="tag pkg" title={'来自交接包：' + p.packageSource.projectName + '（' + p.packageSource.role + '，导出于 ' + p.packageSource.exportedAt + '）'}>
+                交接包{p.packageSource.role === 'source-assumed' ? '·假设源' : p.packageSource.role === 'target' ? '·目标' : '·嵌入证据'}
+              </span>
+            {/if}
+            <span class="mono muted fp">{(p.sha256 ?? '').slice(0, 10)}</span>
           </span>
           {#if p.origin === 'user-imported'}
             <button class="ghost small" onclick={() => app.deleteProfile(p.id)}>删</button>
@@ -201,5 +207,25 @@
     padding: 3px 2px;
     border-bottom: 1px solid #ffffff08;
     gap: 6px;
+  }
+  .profcell {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  }
+  .fp {
+    font-size: 10px;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+  .tag.pkg {
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: #23445a;
+    border: 1px solid #4a8ab066;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 </style>

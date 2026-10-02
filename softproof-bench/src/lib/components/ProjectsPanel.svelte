@@ -18,7 +18,11 @@
       {#each s.projects as p (p.id)}
         <div class="row spread pl">
           <button class="ghost left" onclick={() => app.loadProject(p.id)} title="载入工程">
-            <span>{p.name}</span>
+            <span class="projname">
+              {p.name}
+              {#if p.handover}<span class="tag hv">交接包</span>{/if}
+              {#if p.legacy}<span class="tag legacy" title="旧格式工程：无指纹，按原记录载入，与新交接包共存">旧格式</span>{/if}
+            </span>
             <span class="small muted">{new Date(p.updatedAt).toLocaleString()}</span>
           </button>
           <button class="ghost small danger" onclick={() => app.deleteProject(p.id)}>删</button>
@@ -41,5 +45,25 @@
     display: flex;
     flex-direction: column;
     flex: 1;
+  }
+  .projname {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tag {
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 4px;
+    border: 1px solid #ffffff33;
+    white-space: nowrap;
+  }
+  .tag.hv {
+    background: #23445a;
+    border-color: #4a8ab066;
+  }
+  .tag.legacy {
+    background: #4a3f23;
+    border-color: #b0934a44;
   }
 </style>

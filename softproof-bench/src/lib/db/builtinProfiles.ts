@@ -6,6 +6,7 @@ import srgbUrl from '/profiles/sRGB-elle-V2-srgbtrc.icc?url';
 import cieUrl from '/profiles/CIERGB-elle-V2-g22.icc?url';
 import { idbAll, idbPut, STORE_PROFILES, type StoredProfile } from '../db/db';
 import { readProfileInfo } from '../icc/profileInfo';
+import { sha256 } from '../color/sha256';
 
 export const BUILTIN_PROFILES: { id: string; url: string; label: string }[] = [
   {
@@ -40,6 +41,7 @@ export async function seedBuiltinProfiles(): Promise<StoredProfile[]> {
       origin: 'builtin-open',
       addedAt: new Date().toISOString(),
       size: bytes.byteLength,
+      sha256: await sha256(bytes),
     };
     await idbPut(STORE_PROFILES, profile);
     seeded.push(profile);
