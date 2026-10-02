@@ -23,12 +23,9 @@ import {
   cmsFLAGS_NOCACHE,
 } from 'lcms-wasm';
 import type { ColorSpaceKind } from '../icc/profileInfo';
+import type { RenderingIntent } from './intents';
 
-export type RenderingIntent =
-  | 'perceptual'
-  | 'relative-colorimetric'
-  | 'saturation'
-  | 'absolute-colorimetric';
+export type { RenderingIntent };
 
 export const INTENT_VALUE: Record<RenderingIntent, number> = {
   perceptual: INTENT_PERCEPTUAL,

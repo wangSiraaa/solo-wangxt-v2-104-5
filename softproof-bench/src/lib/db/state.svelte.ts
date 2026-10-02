@@ -6,7 +6,7 @@
  *  - worker conversion results + sampler
  *  - project save/load
  */
-import { idbAll, idbDelete, idbPut, STORE_PROJECTS, STORE_PROFILES, type StoredProfile, type StoredProject } from './db';
+import { idbAll, idbAtomicPut, idbDelete, idbPut, STORE_PROJECTS, STORE_PROFILES, type StoredProfile, type StoredProject } from './db';
 import { seedBuiltinProfiles } from './builtinProfiles';
 import { extractEmbeddedICC, detectContainer } from '../icc/extractEmbedded';
 import { readProfileInfo, type ProfileInfo, type ColorSpaceKind } from '../icc/profileInfo';
@@ -14,6 +14,12 @@ import { detectProvenance } from '../icc/provenance';
 import { runConvert, runSample, type ConvertedPayload } from '../workers/client';
 import type { EngineParams, SampleInfo } from '../color/engine';
 import type { RenderingIntent } from '../color/lcms';
+import { sha256Hex } from '../color/hash';
+import { APP_VERSION } from '../color/record';
+import { buildHandoffPackage, parseHandoffPackage, HandoffValidationError, type HandoffBuildInput } from '../handoff/package';
+import { planHandoffImport, planToWrites } from '../handoff/plan';
+import { HANDOFF_FILE_EXT, HANDOFF_MIME } from '../handoff/format';
+import { downloadBytes } from '../codec/export';
 
 export type SourceStatus =
   | { kind: 'none' }
@@ -38,6 +44,20 @@ interface SamplePoint {
   info?: SampleInfo | null;
   pending?: boolean;
   error?: string;
+}
+
+/** Visible outcome of a handoff-package import (success, conflicts, recovery). */
+export interface HandoffReport {
+  ok: boolean;
+  fileName: string;
+  errors: string[];
+  conflicts: string[];
+  migrations: string[];
+  reused: string[];
+  added: string[];
+  branchNote: string;
+  provenanceWarning: string | null;
+  projectName?: string;
 }
 
 let uid = 1;
@@ -66,6 +86,8 @@ function createAppState() {
     pins: [] as SamplePoint[],
     projects: [] as { id: string; name: string; updatedAt: string }[],
     busyProfiles: false,
+    busyHandoff: false,
+    handoffReport: null as HandoffReport | null,
     notice: '' as string,
     showOriginalManaged: true,
   });
@@ -247,6 +269,8 @@ function createAppState() {
         origin: 'user-imported',
         addedAt: new Date().toISOString(),
         size: bytes.byteLength,
+        sha256: await sha256Hex(bytes),
+        fileName: file.name,
       };
       await idbPut(STORE_PROFILES, profile);
       added.push(profile.description);
@@ -275,6 +299,8 @@ function createAppState() {
       targetProfileId: state.targetProfile?.id ?? null,
       intent: state.intent,
       blackPointCompensation: state.blackPointCompensation,
+      proofIntent: state.proofIntent,
+      schemaVersion: 2,
       provenanceSeen: state.image.provenance.converted,
     };
     await idbPut(STORE_PROJECTS, p);
@@ -324,6 +350,7 @@ function createAppState() {
     state.targetProfile = all.find((x) => x.id === p.targetProfileId) ?? null;
     state.intent = p.intent;
     state.blackPointCompensation = p.blackPointCompensation;
+    state.proofIntent = p.proofIntent ?? 'relative-colorimetric';
     invalidate();
     state.notice = `已载入工程：${p.name}`;
   }
@@ -342,6 +369,194 @@ function createAppState() {
     invalidate();
   }
 
+  // ------------------------------------------------------------------
+  // Handoff package ("工程交接包") export / import
+  // ------------------------------------------------------------------
+
+  function handoffInputFromCurrent(projectName: string): HandoffBuildInput | null {
+    if (!state.image || !state.sourceProfile || !state.targetProfile) return null;
+    const embedded = !!state.image.embedded && !state.sourceAssumed;
+    const source: HandoffBuildInput['source'] = embedded
+      ? { kind: 'embedded' }
+      : {
+          kind: 'assumed',
+          profile: {
+            bytes: state.sourceProfile.bytes,
+            description: state.sourceProfile.description,
+            fileName: state.sourceProfile.fileName,
+            origin: state.sourceProfile.origin === 'builtin-open' ? 'builtin-open' : 'user-imported',
+          },
+          note: state.image.embedded
+            ? '原图含嵌入配置，但操作员改用库中配置作为源空间（假设已记录）'
+            : '原图缺少嵌入配置，操作员手动选择源配置（假设已记录）',
+        };
+    return {
+      projectName: projectName.trim() || state.image.name.replace(/\.[^.]+$/, '') || '工程',
+      imageName: state.image.name,
+      imageBytes: state.image.bytes,
+      embeddedICC: state.image.embedded,
+      source,
+      targetProfile: {
+        bytes: state.targetProfile.bytes,
+        description: state.targetProfile.description,
+        fileName: state.targetProfile.fileName,
+        origin: state.targetProfile.origin === 'builtin-open' ? 'builtin-open' : 'user-imported',
+      },
+      intent: state.intent,
+      blackPointCompensation: state.blackPointCompensation,
+      proofIntent: state.proofIntent,
+      provenance: state.image.provenance,
+      appVersion: APP_VERSION,
+    };
+  }
+
+  async function downloadHandoff(input: HandoffBuildInput): Promise<void> {
+    const bytes = await buildHandoffPackage(input);
+    const base = input.projectName.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80) || 'project';
+    downloadBytes(`${base}${HANDOFF_FILE_EXT}`, bytes, HANDOFF_MIME);
+    state.notice = `交接包已导出：${base}${HANDOFF_FILE_EXT}（含原图、源配置证据、所需 ICC 与指纹、目标条件）`;
+  }
+
+  /** Export the current working state as a verifiable handoff package. */
+  async function exportHandoff(projectName: string) {
+    const input = handoffInputFromCurrent(projectName);
+    if (!input) return;
+    state.busyHandoff = true;
+    try {
+      await downloadHandoff(input);
+    } catch (err) {
+      state.notice = `交接包导出失败：${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      state.busyHandoff = false;
+    }
+  }
+
+  /** Export a previously saved project as a handoff package. */
+  async function exportHandoffProject(id: string) {
+    const p = await idbGetProject(id);
+    if (!p) return;
+    state.busyHandoff = true;
+    try {
+      const all = await idbAll<StoredProfile>(STORE_PROFILES);
+      const findProfile = (pid: string | null) => all.find((x) => x.id === pid) ?? null;
+      const embedded = p.sourceIsEmbedded && !!p.embeddedICC;
+      const assumedProfile = embedded ? null : findProfile(p.sourceProfileId);
+      const target = findProfile(p.targetProfileId);
+      if (!embedded && !assumedProfile) throw new Error('工程引用的源配置已不在配置库中，无法打包');
+      if (!target) throw new Error('工程引用的目标配置已不在配置库中，无法打包');
+      const toRef = (x: StoredProfile) => ({
+        bytes: x.bytes,
+        description: x.description,
+        fileName: x.fileName,
+        origin: x.origin === 'builtin-open' ? ('builtin-open' as const) : ('user-imported' as const),
+      });
+      await downloadHandoff({
+        projectName: p.name,
+        imageName: p.imageName,
+        imageBytes: p.imageBytes,
+        embeddedICC: p.embeddedICC ?? null,
+        source: embedded
+          ? { kind: 'embedded' }
+          : {
+              kind: 'assumed',
+              profile: toRef(assumedProfile!),
+              note: p.sourceAssumptionNote ?? '原图缺少嵌入配置，操作员手动选择源配置（假设已记录）',
+            },
+        targetProfile: toRef(target),
+        intent: p.intent,
+        blackPointCompensation: p.blackPointCompensation,
+        proofIntent: p.proofIntent ?? 'relative-colorimetric',
+        provenance: detectProvenance(p.imageBytes),
+        appVersion: APP_VERSION,
+      });
+    } catch (err) {
+      state.notice = `交接包导出失败：${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      state.busyHandoff = false;
+    }
+  }
+
+  /**
+   * Import a handoff package. The package is fully verified first; only then
+   * are all planned writes committed in ONE IndexedDB transaction — a rejected
+   * or failed import leaves no residue in either store.
+   */
+  async function importHandoff(file: File) {
+    state.busyHandoff = true;
+    state.handoffReport = null;
+    const fail = (errors: string[]) => {
+      state.handoffReport = {
+        ok: false,
+        fileName: file.name,
+        errors,
+        conflicts: [],
+        migrations: [],
+        reused: [],
+        added: [],
+        branchNote: '',
+        provenanceWarning: null,
+      };
+    };
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let parsed;
+      try {
+        parsed = await parseHandoffPackage(bytes);
+      } catch (err) {
+        if (err instanceof HandoffValidationError) {
+          fail(err.issues);
+          return;
+        }
+        throw err;
+      }
+      const [profiles, projects] = await Promise.all([
+        idbAll<StoredProfile>(STORE_PROFILES),
+        idbAll<StoredProject>(STORE_PROJECTS),
+      ]);
+      const plan = await planHandoffImport(parsed, { profiles, projects });
+      await idbAtomicPut(planToWrites(plan));
+
+      state.profiles = await idbAll<StoredProfile>(STORE_PROFILES);
+      state.profiles.sort((a, b) => a.description.localeCompare(b.description));
+      state.projects = (await idbAll<StoredProject>(STORE_PROJECTS)).map((x) => ({
+        id: x.id,
+        name: x.name,
+        updatedAt: x.updatedAt,
+      }));
+      state.projects.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+      state.handoffReport = {
+        ok: true,
+        fileName: file.name,
+        errors: [],
+        conflicts: plan.conflicts,
+        migrations: plan.migrations,
+        reused: plan.reused.map((r) => `${r.description}（复用本机 ${r.localId}）`),
+        added: plan.added.map((a) => `${a.description}（新增 ${a.localId}）`),
+        branchNote: plan.branchNote,
+        provenanceWarning: plan.provenanceWarning,
+        projectName: plan.projectName,
+      };
+      // Load the imported project so the operator immediately sees the
+      // reproduced source/target conditions. Loading re-derives the
+      // provenance marker from the bytes, so converted images stay blocked.
+      // A failure here must not mislabel the already-committed import.
+      try {
+        await loadProject(plan.projectId);
+      } catch (err) {
+        state.notice = `交接包已落库，但自动载入失败：${err instanceof Error ? err.message : String(err)}`;
+      }
+    } catch (err) {
+      fail([err instanceof Error ? err.message : String(err)]);
+    } finally {
+      state.busyHandoff = false;
+    }
+  }
+
+  function dismissHandoffReport() {
+    state.handoffReport = null;
+  }
+
   return {
     state,
     init,
@@ -357,6 +572,10 @@ function createAppState() {
     loadProject,
     deleteProject,
     deleteProfile,
+    exportHandoff,
+    exportHandoffProject,
+    importHandoff,
+    dismissHandoffReport,
     get needsSourceChoice() {
       return needsSourceChoice;
     },

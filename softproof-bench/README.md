@@ -22,6 +22,7 @@
    - 设置记录：单独的 JSON，标明源/目标配置、源假设、意图码、BPC、像素哈希与免责声明；
    - 图像文件都带 `softproof-bench-conversion` 标记（PNG tEXt / TIFF ImageDescription）。
 6. **防止二次转换**：再次导入带标记的“已转换”文件会被识别并拦截，不能把转换结果当原图再转一次。
+7. **工程交接包（.spkg）**：把当前工程或已保存工程打包给另一台离线浏览器——包含原始图片、源配置证据（嵌入 ICC 或人工假设记录）、所需 ICC 二进制及 SHA-256 指纹、目标条件（目标配置/意图/BPC/软打样意图）、工程元数据与格式版本。导入方先完整校验清单与内容关联（指纹、嵌入配置与实际图片一致性、转换标记声明与实际一致性），**全部合法才以一次 IndexedDB 事务落库**；本机已有同指纹配置时安全复用不复制，同名不同字节的配置隔离为新条目并保留包内来源；带转换标记的图片导入后仍被拦截。导入报告明示冲突、迁移（旧配置补指纹）与恢复分支（幂等跳过 / 分叉副本）。
 
 > ⚠️ 未经校准/特征化的显示器上，软打样**不承诺**等同实物打样或印刷成品颜色；本工具用于流程核对、配置确认与数值预览。
 
@@ -32,6 +33,7 @@ src/lib/
   icc/      ICC 头/标签解析、JPEG APP2 / PNG iCCP / WebP ICCP 提取、出处标记检测
   color/    LittleCMS WASM 封装、转换引擎、CIEDE2000、设置记录
   codec/    WASM 解码，PNG / CMYK-TIFF 编码（可嵌 ICC）
+  handoff/  工程交接包：二进制格式（清单+指纹链）、完整校验、导入规划（复用/隔离/幂等）
   db/       IndexedDB、内置开放配置、应用状态（runes）
   workers/  后台转换线程与主线程 client
   components/  Svelte UI
@@ -39,6 +41,16 @@ scripts/      Node 单测、夹具生成、Playwright E2E
 public/profiles/  内置开放 ICC（Elle Stone，公有领域/CC0）
 test-assets/       色块图、透明边缘图、开放 CMYK 配置（CC0）
 ```
+
+### 交接包格式（softproof-bench-handoff/1）
+
+单文件二进制：`SPBPKG01` magic + 清单长度 + 清单 SHA-256 + 清单 JSON + 二进制区。
+清单逐项记录每个二进制（原图、嵌入 ICC、各 ICC 配置）的偏移、长度与 SHA-256
+指纹——文件头锚定清单、清单锚定全部内容，篡改或截断必在校验阶段被发现。
+配置身份 = 字节指纹：同指纹复用；同名不同字节隔离为新条目（id 由指纹派生，
+保留包内来源信息）；工程 id 由清单哈希派生，同一包重复导入幂等，本地已修改
+的同包工程会分叉为 `-rN` 副本而不是被覆盖。旧格式工程记录（无 `schemaVersion`）
+不受影响，可与交接包工程共存、正常载入。
 
 ### 两条转换链不混用
 
@@ -63,7 +75,7 @@ npm run dev          # 打开本地页面
 
 ```bash
 npm run check        # svelte-check + tsc
-npm run test:node    # ICC 解析/提取、PNG/TIFF 编码、出处标记、ΔE2000
+npm run test:node    # ICC 解析/提取、PNG/TIFF 编码、出处标记、ΔE2000、交接包构建/校验/导入规划
 npm run build        # 生产构建
 
 # E2E（先启动 dev，再用 Playwright 安装好的 Chromium）
@@ -71,7 +83,7 @@ npm run dev -- --port 5199 --strictPort
 E2E_URL=http://localhost:5199 npm run test:e2e
 ```
 
-E2E 覆盖：嵌入/缺失配置（强制假设）、CIE RGB 与 CMYK 目标、JPEG(APP2)、16-bit PNG、透明边缘、取样、PNG/TIFF 导出、带标记文件再导入拦截。
+E2E 覆盖：嵌入/缺失配置（强制假设）、CIE RGB 与 CMYK 目标、JPEG(APP2)、16-bit PNG、透明边缘、取样、PNG/TIFF 导出、带标记文件再导入拦截，以及交接包全链路——跨浏览器导入复现来源与目标条件、同指纹配置复用、同名不同字节隔离、篡改/截断拒绝且无残留、重复导入幂等、旧格式工程共存、带标记图片经交接包仍被拦截。
 
 ### 用独立色彩工具验证导出文件
 

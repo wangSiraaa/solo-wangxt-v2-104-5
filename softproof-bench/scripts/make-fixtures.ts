@@ -88,3 +88,12 @@ writeFileSync(
 );
 
 console.log('fixtures written to', dir);
+
+// Same-description-different-bytes ICC: one byte flipped deep in tag data, so
+// the header and 'desc' tag (hence the display name) stay identical to the
+// shipped sRGB profile while the content fingerprint differs. Used by the
+// handoff E2E to prove same-name profiles are isolated, never merged.
+const mod = new Uint8Array(srgbIcc);
+mod[mod.byteLength - 37] ^= 0x5a;
+writeFileSync(resolve(dir, 'srgb-samedesc-modified.icc'), mod);
+console.log('modified-ICC fixture written');

@@ -6,17 +6,20 @@ import srgbUrl from '/profiles/sRGB-elle-V2-srgbtrc.icc?url';
 import cieUrl from '/profiles/CIERGB-elle-V2-g22.icc?url';
 import { idbAll, idbPut, STORE_PROFILES, type StoredProfile } from '../db/db';
 import { readProfileInfo } from '../icc/profileInfo';
+import { sha256Hex } from '../color/hash';
 
-export const BUILTIN_PROFILES: { id: string; url: string; label: string }[] = [
+export const BUILTIN_PROFILES: { id: string; url: string; label: string; fileName: string }[] = [
   {
     id: 'builtin-srgb-elle',
     url: srgbUrl,
     label: 'sRGB (Elle Stone, V2 sRGB TRC)',
+    fileName: 'sRGB-elle-V2-srgbtrc.icc',
   },
   {
     id: 'builtin-ciergb-elle',
     url: cieUrl,
     label: 'CIE RGB (Elle Stone, V2 gamma 2.2) — 广色域开放配置',
+    fileName: 'CIERGB-elle-V2-g22.icc',
   },
 ];
 
@@ -40,6 +43,8 @@ export async function seedBuiltinProfiles(): Promise<StoredProfile[]> {
       origin: 'builtin-open',
       addedAt: new Date().toISOString(),
       size: bytes.byteLength,
+      sha256: await sha256Hex(bytes),
+      fileName: meta.fileName,
     };
     await idbPut(STORE_PROFILES, profile);
     seeded.push(profile);
